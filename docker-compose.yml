@@ -1,0 +1,233 @@
+# Berganews: leitor de notícias (RSS) da família, com IA local.
+# Guia: README.md. Arquitetura e fases: docs/ARQUITETURA.md.
+#
+#   web      App web (Flutter) no nginx, que repassa /api/ à API. Única porta
+#            publicada (WEB_PORT, 8080 por padrão): ponha um proxy com HTTPS
+#            na frente.
+#   api      API do app (web, Android, computador). Login pelo Authentik (OIDC).
+#   fetcher  Coleta os feeds e o texto completo das matérias. Sem internet
+#            direta: sai só pelo proxy `egress`.
+#   ai       Ollama, um trabalho por vez: tradução sob demanda, embeddings e
+#            agrupamento em histórias. Sem internet.
+#   egress   Proxy de saída (smokescreen): recusa redes privadas, então um
+#            "feed" cadastrado não alcança a rede local nem outro container.
+#   db       Postgres com pgvector (embeddings das histórias).
+#   redis    Filas (coletar já, tradução) e o estado do login OIDC.
+#   ollama   Opcional (perfil "ollama"): o Ollama aqui mesmo. Sem ele, aponte
+#            BERGANEWS_OLLAMA_URL para um Ollama que o `ai` alcance.
+#
+# Dados (padrão ./data, ajuste no .env): banco e Redis em
+# ${APPDATA_PATH}/berganews (faça backup); imagens das matérias em
+# ${CACHE_PATH}/berganews/images (recriável).
+
+x-backend: &backend
+  build: ./backend
+  restart: unless-stopped
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+
+x-env: &env
+  TZ: ${TZ:-UTC}
+  DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+  REDIS_URL: redis://redis:6379/0
+  JWT_SECRET: ${BERGANEWS_JWT_SECRET}
+  EGRESS_PROXY: http://berganews-egress:4750
+  OLLAMA_URL: ${BERGANEWS_OLLAMA_URL:-http://ollama:11434}
+  AI_MODEL: ${BERGANEWS_AI_MODEL:-gemma3:4b}
+  AI_KEEP_ALIVE: ${BERGANEWS_AI_KEEP_ALIVE:-2m}
+  EMBED_MODEL: ${BERGANEWS_EMBED_MODEL:-bge-m3}
+  STORY_THRESHOLD: ${BERGANEWS_STORY_THRESHOLD:-0.78}
+  STORY_STRONG: ${BERGANEWS_STORY_STRONG:-0.88}
+  STORY_WINDOW_HOURS: ${BERGANEWS_STORY_WINDOW_HOURS:-72}
+  TRANSLATE_LANGUAGES: ${BERGANEWS_TRANSLATE_LANGUAGES:-pt,en}
+  FETCH_INTERVAL_MINUTES: ${BERGANEWS_FETCH_INTERVAL_MINUTES:-20}
+  ARTICLE_RETENTION_DAYS: ${BERGANEWS_ARTICLE_RETENTION_DAYS:-150}
+  IMAGE_CACHE_DIR: /cache/images
+  LOG_LEVEL: ${BERGANEWS_LOG_LEVEL:-INFO}
+  HOME: /tmp
+
+services:
+  db:
+    image: pgvector/pgvector:0.8.0-pg16
+    container_name: berganews-db
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${APPDATA_PATH:-./data}/berganews/postgres:/var/lib/postgresql/data
+    networks:
+      - berganews-internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  migrate:
+    image: ghcr.io/amacneil/dbmate:2
+    container_name: berganews-migrate
+    restart: "no"
+    volumes:
+      - ./backend/db/migrations:/db/migrations:ro
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}?sslmode=disable
+    command: --migrations-dir /db/migrations --no-dump-schema up
+    networks:
+      - berganews-internal
+    depends_on:
+      db:
+        condition: service_healthy
+
+  redis:
+    image: redis:7-alpine
+    container_name: berganews-redis
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    command: redis-server --appendonly yes
+    volumes:
+      - ${APPDATA_PATH:-./data}/berganews/redis:/data
+    networks:
+      - berganews-internal
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    <<: *backend
+    container_name: berganews-api
+    mem_limit: 512m
+    environment:
+      <<: *env
+      OIDC_ISSUER: ${BERGANEWS_OIDC_ISSUER}
+      BERGANEWS_SSO_CLIENT_ID: ${BERGANEWS_SSO_CLIENT_ID}
+      BERGANEWS_SSO_CLIENT_SECRET: ${BERGANEWS_SSO_CLIENT_SECRET}
+      # Igual à Redirect URI cadastrada no provider do Authentik.
+      OIDC_REDIRECT_URI: ${BERGANEWS_OIDC_REDIRECT_URI}
+      # Opcional: endereço interno do Authentik (vazio = pelo endereço público).
+      OIDC_INTERNAL_URL: ${BERGANEWS_OIDC_INTERNAL_URL:-}
+      OIDC_REQUIRED_GROUP: ${BERGANEWS_USERS_GROUP:-berganews_users}
+      OIDC_ADMIN_GROUP: ${BERGANEWS_ADMINS_GROUP:-berganews_admins}
+    volumes:
+      # Imagens das matérias, servidas pelo /api/img (recriável).
+      - ${CACHE_PATH:-./data/cache}/berganews/images:/cache/images
+    networks:
+      # Banco, Redis e o proxy de saída (achar o feed de um site, baixar
+      # imagens).
+      - berganews-internal
+      # Falar com o Authentik pelo endereço público (OIDC). Com o Authentik
+      # numa rede Docker em comum (BERGANEWS_OIDC_INTERNAL_URL), dá para tirar.
+      - berganews-egress
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health').status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
+
+  web:
+    build: ./frontend
+    container_name: berganews-web
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    networks:
+      - berganews-internal
+      - berganews-web
+    depends_on:
+      - api
+
+  fetcher:
+    <<: *backend
+    container_name: berganews-fetcher
+    mem_limit: 768m
+    command: ["python", "-m", "worker.fetcher"]
+    environment:
+      <<: *env
+    volumes:
+      # Só para a limpeza diária do cache de imagens.
+      - ${CACHE_PATH:-./data/cache}/berganews/images:/cache/images
+    networks:
+      # Só a rede interna: banco, Redis e o proxy de saída. Nada mais.
+      - berganews-internal
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      egress:
+        condition: service_started
+
+  ai:
+    <<: *backend
+    container_name: berganews-ai
+    mem_limit: 256m
+    command: ["python", "-m", "worker.ai"]
+    environment:
+      <<: *env
+    networks:
+      # Banco, Redis e o Ollama do perfil "ollama". Este worker não busca
+      # nenhum endereço de fora.
+      - berganews-internal
+
+  egress:
+    build:
+      context: egress
+    container_name: berganews-egress
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 128m
+    networks:
+      - berganews-internal
+      - berganews-egress
+
+  # Opcional (perfil "ollama"): `docker compose --profile ollama up -d`.
+  # Baixe os modelos uma vez: docker exec berganews-ollama ollama pull gemma3:4b
+  # (e bge-m3). Com GPU NVIDIA, acrescente o `deploy.resources` do Ollama.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: berganews-ollama
+    restart: unless-stopped
+    profiles: ["ollama"]
+    volumes:
+      - ${APPDATA_PATH:-./data}/berganews/ollama:/root/.ollama
+    networks:
+      berganews-internal:
+        aliases: [ollama]
+      berganews-egress: {}   # baixar os modelos
+
+networks:
+  # Banco, Redis, workers e proxy. Sem saída para a internet.
+  berganews-internal:
+    name: berganews-internal
+    internal: true
+  # Só o proxy de saída (e o Ollama, para baixar modelos) usa a internet.
+  berganews-egress:
+    name: berganews-egress
+  # Porta publicada do `web` (uma rede interna não publica portas).
+  berganews-web:
+    name: berganews-web
